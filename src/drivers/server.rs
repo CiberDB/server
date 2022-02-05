@@ -1,17 +1,29 @@
-use std::{net::TcpListener};
+use std::{net::{TcpListener, TcpStream}, io::Error};
+use super::context;
 
 pub trait Listen {
     fn listen(&self);
+    fn on_request(&self, stream: &Result<TcpStream, Error>);
 }
 
-pub struct Server ();
+pub struct Server {
+    pub context: context::Context,
+}
 
 impl Listen for Server {
+
+    fn on_request(&self, stream: &Result<TcpStream, Error>) {
+        let mut _stream = stream.as_ref().unwrap();
+        println!("Connection established!");
+    }
+
     fn listen(&self) {
-        let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+        let settings = &self.context.settings;
+        let host = format!("{}:{}", &settings.host, &settings.port);
+        let listener = TcpListener::bind(&host).unwrap();
+        println!("Listening on: {}", &host);
         for stream in listener.incoming() {
-            let mut _stream = stream.unwrap();
-            println!("Connection established!");
+            self.on_request(&stream);
         }
     }
 }
