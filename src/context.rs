@@ -6,9 +6,3 @@ pub struct Settings {
 pub struct Context {
     pub settings: Settings,
 }
-
-pub fn get_context(settings: Settings) -> Context {
-    Context {
-        settings
-    }
-}

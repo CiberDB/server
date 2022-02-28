@@ -1,9 +1,5 @@
-use self::server::Listen;
-pub mod context;
-mod server;
+use super::context::{Context, Settings};
 
-pub fn listen(settings: context::Settings) {
-    let context = context::get_context(settings);
-    let server = server::Server { context: context };
-    server.listen();
+pub fn get_context(settings: Settings) -> Context {
+    Context { settings }
 }
