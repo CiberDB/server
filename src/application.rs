@@ -1,17 +1,14 @@
 use crate::context::Settings;
 
 use super::context::Context;
-use ctrlc::set_handler;
-use openssl::pkey::Private;
-use openssl::rsa::{Padding, Rsa};
-use std::io::{Error, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::thread;
 use std::vec::Vec;
 
 struct Connection {
     stream: TcpStream,
-    cert: Vec<u8>,
+    should_close: bool,
 }
 
 struct State {
@@ -19,98 +16,94 @@ struct State {
     is_listening: bool,
 }
 
-fn handle_request(request: String) -> String {
-    println!("{}", request);
-    return String::from("olá mundo");
+static mut STATE: State = State {
+    is_listening: true,
+    connections: vec![],
+};
+
+async fn handle_request(query: String) -> String {
+    println!("{}", query);
+    return String::from("Olá mundo");
 }
 
-fn decrypt_request(mut stream: &TcpStream, _rsa: &Rsa<Private>) -> Result<String, String> {
-    let mut buffer: Vec<u8> = vec![];
-    let _ = stream.read(&mut buffer);
-    if buffer.len() == 0 {
-        return Err("Empty request".to_string());
-    }
-    // let mut request: Vec<u8> = vec![];
-    // let padding = Padding::PKCS1;
-    // rsa.public_decrypt(&buffer, &mut request, padding).unwrap();
-    return Ok(String::from_utf8(buffer).unwrap());
-}
-
-fn encrypt_response(response: String, cert: &Vec<u8>) -> Vec<u8> {
-    let mut response_bytes: Vec<u8> = vec![];
-    let rsa = Rsa::public_key_from_pem(cert).unwrap();
-    let padding = Padding::PKCS1;
-    rsa.public_encrypt(response.as_bytes(), &mut response_bytes, padding)
-        .expect("Failed to encrypt response");
-    return response_bytes;
-}
-
-fn add_connection<'a>(
-    mut stream: TcpStream,
-    state: &'a mut State,
-    cert: &'a Vec<u8>,
-) -> Result<&'a mut State, String> {
-    let mut client_cert: Vec<u8> = Vec::new();
-    stream.read(&mut client_cert).unwrap();
-    if client_cert.len() == 0 {
-        stream.write("Invalid request".as_bytes()).err();
-        return Err("Invalid certificate".to_string());
-    }
-    stream.write(&cert).unwrap();
-    let connection = Connection {
-        stream,
-        cert: client_cert,
-    };
-    state.connections.push(connection);
-    return Ok(state);
-}
-
-fn get_requests(state: &mut State, rsa: Rsa<Private>) {
+async fn manage_requests(state: &mut State) {
     while state.is_listening {
-        let iter = state.connections.iter();
-        for connection in iter {
-            let mut stream = &connection.stream;
-            let request = decrypt_request(stream, &rsa);
-            match request {
-                Ok(request) => {
-                    let response = handle_request(request);
-                    let response_bytes = encrypt_response(response, &connection.cert);
-                    let _ = stream.write(&response_bytes);
-                }
-                Err(_) => {
+        for connection in state.connections.iter_mut() {
+            if !connection.should_close {
+                let mut stream = &connection.stream;
+                let err = stream.write(&[0]).is_err();
+                if err {
+                    connection.should_close = true;
                     continue;
                 }
+                let mut buffer = vec![];
+                stream.read_to_end(&mut buffer).err();
+                if buffer.len() > 0 {
+                    let body = String::from_utf8(buffer).unwrap();
+                    let response = handle_request(body).await;
+                    let has_error = stream.write(response.as_bytes()).is_err();
+                    stream.flush().expect("Failed to flush");
+                    if has_error {
+                        connection.should_close = true;
+                    }
+                }
             }
+        }
+    }
+}
+
+async fn clear_queue(state: &mut State) {
+    state.connections.retain(|request| {
+        if request.should_close {
+            request.stream.shutdown(Shutdown::Both).unwrap();
+            println!("Connection closed {}", request.stream.peer_addr().unwrap());
+        }
+        return !request.should_close;
+    });
+}
+
+fn manage_connections(context: Context, state: &mut State) {
+    let settings: Settings = context.settings;
+    let host: String = format!("{}:{}", settings.host, settings.port);
+    let listener = TcpListener::bind(&host).unwrap();
+    listener
+        .set_nonblocking(true)
+        .expect("Cannot set non-blocking");
+    println!("Listening on: {}", host);
+    let clearing_queue = tokio::runtime::Runtime::new().unwrap();
+    while state.is_listening {
+        clearing_queue.block_on(clear_queue(state));
+        let incoming = listener.accept();
+        match incoming {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(true)
+                    .expect("Failed to set non blocking");
+                state.connections.push(Connection {
+                    stream,
+                    should_close: false,
+                });
+                println!("New connection");
+            }
+            Err(_error) => continue,
         }
     }
 }
 
 pub fn run(context: Context) {
-    let settings: Settings = context.settings;
-    let cert = settings.rsa.public_key_to_pem().unwrap();
-    let host: String = format!("{}:{}", settings.host, settings.port);
-    let listener = TcpListener::bind(&host).unwrap();
-    static mut STATE: State = State {
-        is_listening: true,
-        connections: Vec::new(),
-    };
-    thread::spawn(move || unsafe {
-        get_requests(&mut STATE, settings.rsa);
-    });
-    println!("Listening on: {}", host);
-    for stream in listener.incoming() {
-        unsafe {
-            if !STATE.is_listening {
-                break;
-            }
-        }
-        match stream {
-            Ok(stream) => unsafe {
-                add_connection(stream, &mut STATE, &cert).err();
-            },
-            Err(error) => {
-                println!("Error to establish new connection - {:?}", error.kind())
-            }
-        }
+    unsafe {
+        thread::spawn(|| {
+            let checking_requests =
+                tokio::runtime::Runtime::new().expect("Could not start manage requests");
+            checking_requests.block_on(manage_requests(&mut STATE));
+        });
+        manage_connections(context, &mut STATE);
+    }
+}
+
+pub fn stop() {
+    unsafe {
+        print!("\nStopping server\n");
+        STATE.is_listening = false;
     }
 }
